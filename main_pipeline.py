@@ -240,6 +240,38 @@ def plot_residuals(y_true, y_pred, index, h):
     plt.close()
 
 
+def plot_hourly_heatmap(test_df: pd.DataFrame, target_col: str) -> None:
+    """Plot 4-week hourly heatmap using the test set."""
+    if test_df.empty:
+        logger.warning("Test dataframe is empty; skipping hourly heatmap.")
+        return
+
+    start = test_df.index.min()
+    end = start + pd.Timedelta(days=28)
+    subset = test_df.loc[(test_df.index >= start) & (test_df.index < end)]
+
+    if subset.empty:
+        logger.warning("No data available for the first 28 days of the test set.")
+        return
+
+    hourly = subset[target_col].resample('H').mean().to_frame('value')
+    hourly['day'] = hourly.index.date
+    hourly['hour'] = hourly.index.hour
+    pivot = hourly.pivot_table(index='day', columns='hour', values='value')
+
+    plt.figure(figsize=(12, 6))
+    plt.imshow(pivot.values, aspect='auto', origin='lower', cmap='viridis')
+    plt.xlabel('Hour')
+    plt.ylabel('Day')
+    plt.title('Test Set Hourly Heatmap (First 28 Days)')
+    plt.colorbar(label='Hourly Mean')
+    plt.xticks(ticks=np.arange(0, 24, 2), labels=[str(h) for h in range(0, 24, 2)])
+    plt.yticks(ticks=np.arange(len(pivot.index)), labels=[str(d) for d in pivot.index])
+    plt.tight_layout()
+    plt.savefig(outpath('fig_hourly_heatmap.png'))
+    plt.close()
+
+
 def plot_uncertainty(y_true, y_lower, y_upper, index, alpha, h):
     """Plot prediction intervals."""
     subset = slice(-144*7, -144*6)
@@ -381,6 +413,9 @@ def run_experiment(config, pipe_config, include_lights=True, perform_full_analys
     test_size = int(len(df_eng) * pipe_config.test_size_percent)
     train_size = len(df_eng) - test_size
     test_index = df_eng.index[train_size:]
+    test_df = df_eng.iloc[train_size:]
+
+    plot_hourly_heatmap(test_df, pipe_config.target_col)
 
     # Assumption audit: clarify whether current load y_t is being used as a predictor (directly or via diffs)
     current_load_features_present = [
@@ -609,6 +644,112 @@ def run_nested_cv_experiment(config, pipe_config):
     return cv_results, summary
 
 
+def run_scenario_analysis(
+    df_eng: pd.DataFrame,
+    pipe_config: PipelineConfig,
+    config: dict,
+    base_metrics: dict
+) -> pd.DataFrame:
+    """Run scenario analysis with feature subsets and save results."""
+    drop_cols = [pipe_config.target_col, pipe_config.time_col, 'date', 'target_ahead']
+    feature_cols = [c for c in df_eng.columns if c not in drop_cols]
+    target_col = 'target_ahead' if 'target_ahead' in df_eng.columns else pipe_config.target_col
+
+    negative_controls = set(pipe_config.negative_control_cols)
+    negative_controls.update({c for c in feature_cols if c.startswith('negctrl')})
+
+    weather_cols = [
+        c for c in ['T_out', 'Press_mm_hg', 'RH_out', 'Windspeed', 'Visibility', 'Tdewpoint']
+        if c in feature_cols
+    ]
+    time_cols = [
+        c for c in [
+            'hour', 'month', 'day_of_week', 'is_weekend',
+            'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
+            'month_sin', 'month_cos', 'tod_sin', 'tod_cos'
+        ]
+        if c in feature_cols
+    ]
+    derived_indoor_cols = [c for c in ['T_indoor_avg', 'T_indoor_std', 'RH_indoor_avg'] if c in feature_cols]
+    derived_weather_cols = [c for c in ['DeltaT', 'DeltaT_abs'] if c in feature_cols]
+
+    def filter_features(cols, drop=None, keep=None):
+        filtered = [c for c in cols if c not in negative_controls]
+        if keep is not None:
+            filtered = [c for c in filtered if c in keep]
+        if drop:
+            filtered = [c for c in filtered if c not in drop]
+        return filtered
+
+    base_features = filter_features(feature_cols)
+    no_lights_features = filter_features(feature_cols, drop=['lights'])
+    no_weather_features = filter_features(feature_cols, drop=weather_cols + derived_weather_cols)
+    only_weather_time_features = filter_features(
+        feature_cols,
+        drop=['lights'] + derived_indoor_cols + derived_weather_cols,
+        keep=weather_cols + time_cols
+    )
+
+    scenarios = [
+        ("All Features", base_features),
+        ("No Lights", no_lights_features),
+        ("No Weather", no_weather_features),
+        ("Only Weather + Time", only_weather_time_features)
+    ]
+
+    test_size = int(len(df_eng) * pipe_config.test_size_percent)
+    train_size = len(df_eng) - test_size
+    train_df = df_eng.iloc[:train_size]
+    test_df = df_eng.iloc[train_size:]
+
+    y_train = train_df[target_col].values
+    y_test = test_df[target_col].values
+
+    results = []
+    for scenario_name, cols in scenarios:
+        if not cols:
+            logger.warning(f"No features available for scenario '{scenario_name}'. Skipping.")
+            continue
+
+        X_train = train_df[cols]
+        X_test = test_df[cols]
+
+        model = SafeLGBMRegressor(**config['models']['lightgbm'], random_state=42, verbose=-1)
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+
+        metrics = calculate_metrics(y_test, y_pred)
+        row = {
+            'Scenario': scenario_name,
+            'Forecast_Horizon': pipe_config.forecast_horizon_h,
+            'RMSE': metrics['RMSE'],
+            'MAE': metrics['MAE'],
+            'R2': metrics['R2']
+        }
+
+        if scenario_name == "All Features":
+            picp = base_metrics.get('PICP', np.nan)
+            mpiw = base_metrics.get('MPIW', np.nan)
+            if np.isnan(picp) or np.isnan(mpiw):
+                logger.warning("PICP/MPIW missing from base metrics; storing NaN for scenario analysis.")
+            row['PICP'] = picp
+            row['MPIW'] = mpiw
+        else:
+            row['PICP'] = np.nan
+            row['MPIW'] = np.nan
+
+        results.append(row)
+
+    results_df = pd.DataFrame(results)
+    h = pipe_config.forecast_horizon_h
+    try:
+        save_table(results_df, f"results_scenarios_h{h}")
+    except Exception:
+        results_df.to_csv(outpath(f"results_scenarios_h{h}.csv"), index=False)
+
+    return results_df
+
+
 def run_toy_optimization_demonstration(baseline_daily_energy_kwh):
     """DEMONSTRATION-ONLY: Illustrative Toy Optimization."""
     logger.info("Running TOY Optimization (DEMONSTRATION ONLY)...")
@@ -741,6 +882,11 @@ if __name__ == "__main__":
     metrics_main, baseline_metrics = run_experiment(
         config, pipe_config, include_lights=True, perform_full_analysis=(not args.quick)
     )
+
+    logger.info("\nPHASE 1B: Scenario Analysis")
+    df_raw = pipeline_core.load_data(config['paths']['data'])
+    df_eng = pipeline_core.create_physics_features(df_raw, pipe_config)
+    run_scenario_analysis(df_eng, pipe_config, config, metrics_main)
     
     logger.info("\nPHASE 2: Comparison Experiment (Without Lights)")
     metrics_no_lights, _ = run_experiment(
