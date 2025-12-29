@@ -361,6 +361,132 @@ def plot_baseline_comparison(metrics_dict, h):
     plt.close()
 
 
+def generate_hourly_heatmap(df, target_col, h):
+    """Generates a 4-week hourly heatmap from the test set."""
+    logger.info("Generating 4-week hourly heatmap (Deliverable A)...")
+
+    # Select first 28 days of data
+    df_subset = df.iloc[:28*144].copy() # 28 days * 144 (10-min intervals)
+
+    # Resample to hourly mean
+    df_hourly = df_subset[[target_col]].resample('H').mean()
+
+    # Create pivot table: Day (y-axis) vs Hour (x-axis)
+    df_hourly['day'] = df_hourly.index.date
+    df_hourly['hour'] = df_hourly.index.hour
+
+    pivot_table = df_hourly.pivot(index='day', columns='hour', values=target_col)
+
+    plt.figure(figsize=(12, 8))
+    sns.heatmap(pivot_table, cmap='viridis', cbar_kws={'label': 'Energy (Wh)'})
+    plt.title(f'Hourly Energy Consumption Heatmap (First 4 Weeks of Test Set)')
+    plt.ylabel('Date')
+    plt.xlabel('Hour of Day')
+    plt.tight_layout()
+    plt.savefig(outpath('fig_hourly_heatmap.png'))
+    plt.close()
+
+
+def run_scenario_analysis(config, pipe_config, df_eng, metrics_main):
+    """
+    Runs additional scenarios for the results table (Deliverable C).
+    Scenarios:
+    1. All features (metrics_main)
+    2. No Lights (computed in Phase 2, passed if available, otherwise computed here)
+    3. No Weather (Exclude T_out, Press, RH_out, Windspeed, Visibility, Tdewpoint)
+    4. Only Weather + Time (Exclude indoor sensors T*, RH_*, and lights)
+    """
+    logger.info("Running Scenario Analysis (Deliverable C)...")
+
+    # Define excluded columns for "No Weather"
+    # Must exclude raw weather columns AND derived features that depend on them
+    weather_cols = ['T_out', 'Press_mm_hg', 'RH_out', 'Windspeed', 'Visibility', 'Tdewpoint']
+    weather_derived = ['DeltaT', 'DeltaT_abs'] # derived using T_out
+
+    # Define excluded columns for "Only Weather + Time"
+    # Must exclude all indoor sensors, lights, and indoor-derived aggregates
+    indoor_cols = []
+    for i in range(1, 10):
+        indoor_cols.append(f'T{i}')
+        indoor_cols.append(f'RH_{i}')
+
+    # Indoor derived features
+    indoor_derived = ['T_indoor_avg', 'T_indoor_std', 'RH_indoor_avg']
+
+    # Negative controls to exclude from ALL scenarios (Strict Match)
+    # We filter these dynamically in the loop to be robust
+
+    scenarios = [
+        {'name': 'All Features', 'exclude': [], 'uncertainty_source': metrics_main},
+        {'name': 'No Lights', 'exclude': ['lights']},
+        {'name': 'No Weather', 'exclude': weather_cols + weather_derived},
+        {'name': 'Only Weather + Time', 'exclude': indoor_cols + indoor_derived + weather_derived + ['lights']}
+    ]
+
+    results = []
+
+    X_train, X_test, y_train, y_test, all_feature_cols = pipeline_core.get_chronological_split(
+        df_eng, pipe_config
+    )
+
+    # Train/Test logic
+    for scen in scenarios:
+        row = {'Scenario': scen['name']}
+
+        # Determine features to use
+        # Start with all features
+        features_to_use = [f for f in all_feature_cols]
+
+        # Remove excluded features
+        exclude_list = scen['exclude']
+        features_to_use = [f for f in features_to_use if f not in exclude_list]
+
+        # ALWAYS remove negative controls for scientific scenarios
+        # Robust filtering: exact match for rv1/rv2, startswith for negctrl
+        features_to_use = [
+            f for f in features_to_use
+            if f not in ['rv1', 'rv2'] and not f.startswith('negctrl')
+        ]
+
+        logger.info(f"  Scenario: {scen['name']} (Features: {len(features_to_use)})")
+
+        # Prepare Data
+        # Map feature names to indices in X_train/X_test
+        # Wait, X_train is numpy array. Need to use DataFrame or map indices.
+        # Let's rebuild DataFrames
+        X_train_df = pd.DataFrame(X_train, columns=all_feature_cols)
+        X_test_df = pd.DataFrame(X_test, columns=all_feature_cols)
+
+        X_train_sub = X_train_df[features_to_use]
+        X_test_sub = X_test_df[features_to_use]
+
+        # Train Model
+        model = SafeLGBMRegressor(**config['models']['lightgbm'], random_state=42, verbose=-1)
+        model.fit(X_train_sub, y_train)
+        y_pred = model.predict(X_test_sub)
+
+        # Metrics
+        m = calculate_metrics(y_test, y_pred)
+
+        # Add Uncertainty if source provided (e.g. for All Features)
+        picp, mpiw = np.nan, np.nan
+        if 'uncertainty_source' in scen:
+             source = scen['uncertainty_source']
+             picp = source.get('PICP', np.nan)
+             mpiw = source.get('MPIW', np.nan)
+
+             if np.isnan(picp):
+                 logger.warning(f"Uncertainty metrics missing for scenario '{scen['name']}' (likely running in --quick mode).")
+
+        row.update({
+            'RMSE': m['RMSE'], 'MAE': m['MAE'], 'R2': m['R2'],
+            'PICP': picp, 'MPIW': mpiw
+        })
+        results.append(row)
+
+    return pd.DataFrame(results)
+
+
 def run_experiment(config, pipe_config, include_lights=True, perform_full_analysis=False):
     """Run the main forecasting experiment."""
     scenario = "With Lights" if include_lights else "Without Lights"
@@ -755,6 +881,36 @@ if __name__ == "__main__":
         pipe_config.include_lights = False
         cv_results_no_lights, _ = run_nested_cv_experiment(config, pipe_config)
     
+    # Deliverable A: 4-week hourly heatmap
+    # Generate regardless of --quick mode (it is lightweight)
+    df_raw = pipeline_core.load_data(config['paths']['data'])
+    df_eng = pipeline_core.create_physics_features(df_raw, pipe_config)
+    _, _, _, _, _ = pipeline_core.get_chronological_split(df_eng, pipe_config) # Just to get indices
+    test_size = int(len(df_eng) * pipe_config.test_size_percent)
+    test_df = df_eng.iloc[-test_size:]
+    generate_hourly_heatmap(test_df, pipe_config.target_col, pipe_config.forecast_horizon_h)
+
+    # Deliverable C: Scenario Table
+    # Need the full DF again for scenario analysis
+    df_raw = pipeline_core.load_data(config['paths']['data'])
+    # Ensure pipe_config.include_lights is True for the "All Features" base
+    pipe_config.include_lights = True
+    df_eng = pipeline_core.create_physics_features(df_raw, pipe_config)
+
+    # Run Scenario Analysis
+    # We pass metrics_main (All features) to avoid re-running it.
+    # For "No Lights", we have metrics_no_lights, but run_scenario_analysis expects to run logic.
+    # Let's just update the list in run_scenario_analysis to accept pre-computed.
+
+    df_scenarios = run_scenario_analysis(config, pipe_config, df_eng, metrics_main)
+
+    # Sort or reorder
+    order = ['All Features', 'No Lights', 'No Weather', 'Only Weather + Time']
+    df_scenarios['Scenario'] = pd.Categorical(df_scenarios['Scenario'], categories=order, ordered=True)
+    df_scenarios = df_scenarios.sort_values('Scenario')
+
+    save_table(df_scenarios, f'results_scenarios_h{pipe_config.forecast_horizon_h}')
+
     logger.info("\nPHASE 4: Generating Summary Tables")
     
     df_ts = pd.DataFrame([metrics_main])
