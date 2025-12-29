@@ -168,6 +168,10 @@ def create_physics_features(df_input: pd.DataFrame, config: PipelineConfig) -> p
     df['month'] = df.index.month
     df['day_of_week'] = df.index.dayofweek
     df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+
+    nsm_sec = df.index.hour * 3600 + df.index.minute * 60 + df.index.second
+    df['tod_sin'] = np.sin(2 * np.pi * nsm_sec / 86400)
+    df['tod_cos'] = np.cos(2 * np.pi * nsm_sec / 86400)
     
     df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
     df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)

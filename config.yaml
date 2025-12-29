@@ -18,6 +18,7 @@ settings:
   block_permutation_block_size: 144
   negctrl_max_rel_mse_increase: 0.001
   negctrl_z_threshold: 2.0
+  time_features: [tod_sin, tod_cos]  # NSM-based time-of-day encoding
   synthetic_negative_controls:
     enabled: true
     n_controls: 5
