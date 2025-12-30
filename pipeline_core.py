@@ -30,7 +30,7 @@ from scipy import stats
 from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
+from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV, train_test_split
 from sklearn.linear_model import Ridge, Lasso, ElasticNet
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.pipeline import Pipeline
@@ -768,8 +768,58 @@ def run_nested_cv(df: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
-def get_chronological_split(df: pd.DataFrame, config: PipelineConfig) -> Tuple:
-    """Returns (X_train, X_test, y_train, y_test, feature_cols)."""
+def filter_paper_mode_features(df_columns: List[str]) -> List[str]:
+    """
+    Returns a whitelist of features for Strict Paper Mode.
+
+    Paper Mode Whitelist:
+    - Indoor Sensors: T1..T9, RH_1..RH_9
+    - Weather: T_out, Press_mm_hg, RH_out, Windspeed, Visibility, Tdewpoint
+    - Lights: lights (optional, handled by include_lights in pipeline config)
+    - Time: NSM (tod_sin, tod_cos) + DayOfWeek/WeekStatus/Month indicators
+
+    EXCLUDED:
+    - Lags, Rolling stats, Diffs
+    - Derived indoor features (DeltaT, T_indoor_avg, etc.)
+    """
+    whitelist = []
+
+    # 1. Indoor Sensors
+    for i in range(1, 10):
+        whitelist.append(f'T{i}')
+        whitelist.append(f'RH_{i}')
+
+    # 2. Weather
+    weather_cols = ['T_out', 'Press_mm_hg', 'RH_out', 'Windspeed', 'Visibility', 'Tdewpoint']
+    whitelist.extend(weather_cols)
+
+    # 3. Lights (if present)
+    whitelist.append('lights')
+
+    # 4. Time Encodings
+    time_cols = [
+        'tod_sin', 'tod_cos', 'hour_sin', 'hour_cos',
+        'dow_sin', 'dow_cos', 'month_sin', 'month_cos',
+        'is_weekend', 'hour', 'month', 'day_of_week'
+    ]
+    whitelist.extend(time_cols)
+
+    # Filter only columns that actually exist in the dataframe
+    return [c for c in df_columns if c in whitelist]
+
+
+def get_data_split(df: pd.DataFrame, config: PipelineConfig,
+                   split_method: str = 'chronological') -> Tuple:
+    """
+    Returns (X_train, X_test, y_train, y_test, feature_cols).
+
+    Supports:
+    - 'chronological': Standard time-series split (past -> future).
+    - 'random': Randomized split (strictly for Paper Mode comparison).
+
+    SAFETY CHECK:
+    If split_method='random', we strictly enforce that NO LAGS and NO ROLLING features are present.
+    """
     drop_cols = [config.target_col, config.time_col, 'date', 'target_ahead']
     if 'lights' in df.columns and not config.include_lights:
         drop_cols.append('lights')
@@ -777,20 +827,54 @@ def get_chronological_split(df: pd.DataFrame, config: PipelineConfig) -> Tuple:
     feature_cols = [c for c in df.columns if c not in drop_cols and c in df.columns]
     target_col = 'target_ahead' if 'target_ahead' in df.columns else config.target_col
     
-    test_size = int(len(df) * config.test_size_percent)
-    train_size = len(df) - test_size
-    
-    train = df.iloc[:train_size]
-    test = df.iloc[train_size:]
-    
-    X_train = train[feature_cols].values
-    y_train = train[target_col].values
-    X_test = test[feature_cols].values
-    y_test = test[target_col].values
-    
-    logger.info(f"Chronological split: Train={train_size}, Test={test_size}")
+    if split_method == 'random':
+        # STRICT LEAKAGE CHECK
+        leakage_keywords = ['_lag', '_roll', '_diff', 'target_ahead']
+        # Note: target_ahead is the target, but we mean features derived from it.
+        # Features like Appliances_lag1, Appliances_roll6_mean
+
+        leaky_features = [f for f in feature_cols if any(k in f for k in ['_lag', '_roll', '_diff'])]
+
+        if leaky_features:
+            raise ValueError(
+                f"CRITICAL: Random split requested but leaky features found! "
+                f"Random split is ONLY allowed for Paper Mode (raw features). "
+                f"Leaky features detected: {leaky_features[:5]}..."
+            )
+
+        logger.info("Random split requested. Performing shuffled train/test split (Paper Mode safe).")
+
+        X = df[feature_cols].values
+        y = df[target_col].values
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y,
+            test_size=config.test_size_percent,
+            shuffle=True,
+            random_state=config.random_seed
+        )
+
+    else:
+        # Chronological Split
+        test_size = int(len(df) * config.test_size_percent)
+        train_size = len(df) - test_size
+
+        train = df.iloc[:train_size]
+        test = df.iloc[train_size:]
+
+        X_train = train[feature_cols].values
+        y_train = train[target_col].values
+        X_test = test[feature_cols].values
+        y_test = test[target_col].values
+
+        logger.info(f"Chronological split: Train={train_size}, Test={test_size}")
     
     return X_train, X_test, y_train, y_test, feature_cols
+
+
+def get_chronological_split(df: pd.DataFrame, config: PipelineConfig) -> Tuple:
+    """Wrapper for backward compatibility."""
+    return get_data_split(df, config, split_method='chronological')
 
 
 def compute_permutation_importance(model, X_test: Union[np.ndarray, pd.DataFrame], 
