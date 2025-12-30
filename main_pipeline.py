@@ -425,6 +425,7 @@ def run_scenario_analysis(config, pipe_config, df_eng, metrics_main):
 
     results = []
 
+    # Get split from main config
     X_train, X_test, y_train, y_test, all_feature_cols = pipeline_core.get_chronological_split(
         df_eng, pipe_config
     )
@@ -432,6 +433,25 @@ def run_scenario_analysis(config, pipe_config, df_eng, metrics_main):
     # Train/Test logic
     for scen in scenarios:
         row = {'Scenario': scen['name']}
+
+        # DIRECTLY USE METRICS_MAIN FOR "ALL FEATURES"
+        if scen['name'] == 'All Features':
+            logger.info("  Scenario: All Features (Reusing main metrics)")
+            m = metrics_main
+
+            # Uncertainty handling
+            picp, mpiw = np.nan, np.nan
+            if 'PICP' in m:
+                picp = m['PICP']
+            if 'MPIW' in m:
+                mpiw = m['MPIW']
+
+            row.update({
+                'RMSE': m['RMSE'], 'MAE': m['MAE'], 'R2': m['R2'],
+                'PICP': picp, 'MPIW': mpiw
+            })
+            results.append(row)
+            continue
 
         # Determine features to use
         # Start with all features
@@ -487,9 +507,13 @@ def run_scenario_analysis(config, pipe_config, df_eng, metrics_main):
     return pd.DataFrame(results)
 
 
-def run_experiment(config, pipe_config, include_lights=True, perform_full_analysis=False):
+def run_experiment(config, pipe_config, include_lights=True, perform_full_analysis=False,
+                   split_method='chronological', paper_mode=False):
     """Run the main forecasting experiment."""
     scenario = "With Lights" if include_lights else "Without Lights"
+    if paper_mode:
+        scenario = f"Paper Mode ({split_method})"
+
     logger.info(f"Running Experiment: {scenario}")
     logger.info(f"Forecast Horizon: h = {pipe_config.forecast_horizon_h} steps")
     
@@ -500,13 +524,45 @@ def run_experiment(config, pipe_config, include_lights=True, perform_full_analys
     
     pipeline_core.check_leakage(df_eng, pipe_config.target_col, pipe_config.forecast_horizon_h)
     
-    X_train, X_test, y_train, y_test, feature_cols = pipeline_core.get_chronological_split(
-        df_eng, pipe_config
+    # Paper Mode Filtering
+    if paper_mode:
+        logger.info("Applying Paper Mode feature whitelist...")
+        cols = list(df_eng.columns)
+        whitelisted = pipeline_core.filter_paper_mode_features(cols)
+
+        # Ensure target_ahead and date are kept (handled by get_data_split but needed for DF structure)
+        # However, filter_paper_mode_features returns only features.
+        # We need to keep target, date, target_ahead in the DataFrame for get_data_split to work.
+
+        keep_cols = whitelisted + [pipe_config.target_col, pipe_config.time_col, 'target_ahead']
+        if 'date' not in keep_cols and 'date' in df_eng.columns:
+            keep_cols.append('date')
+
+        # Also need to keep negative controls if we want to drop them later or use them?
+        # Paper mode strictly excludes them.
+
+        # Filter DataFrame columns
+        # Using intersection to avoid KeyError if some columns missing
+        valid_cols = [c for c in keep_cols if c in df_eng.columns]
+        df_eng = df_eng[valid_cols].copy()
+
+        logger.info(f"Features filtered for Paper Mode. Count: {len(valid_cols)}")
+
+
+    X_train, X_test, y_train, y_test, feature_cols = pipeline_core.get_data_split(
+        df_eng, pipe_config, split_method=split_method
     )
     
-    test_size = int(len(df_eng) * pipe_config.test_size_percent)
-    train_size = len(df_eng) - test_size
-    test_index = df_eng.index[train_size:]
+    if split_method == 'chronological':
+        test_size = int(len(df_eng) * pipe_config.test_size_percent)
+        train_size = len(df_eng) - test_size
+        test_index = df_eng.index[train_size:]
+    else:
+        # For random split, test_index is not contiguous time.
+        # We can try to reconstruct it or just use dummy index for plots.
+        # However, for Paper Mode (Random), we mostly care about metrics.
+        # Using RangeIndex for plotting if needed.
+        test_index = pd.RangeIndex(len(y_test))
 
     # Assumption audit: clarify whether current load y_t is being used as a predictor (directly or via diffs)
     current_load_features_present = [
@@ -520,12 +576,12 @@ def run_experiment(config, pipe_config, include_lights=True, perform_full_analys
         "current_load_features_present": current_load_features_present,
         "notes": "If current_load_available=False, features that depend on y_t (diff/lag0) should be absent."
     }
-    with open(outpath('assumption_audit.json'), 'w') as f:
+    with open(outpath(f'assumption_audit_{scenario.replace(" ", "_")}.json'), 'w') as f:
         json.dump(assumption_audit, f, indent=4)
     
-    if perform_full_analysis:
-        train_df = df_eng.iloc[:train_size]
-        test_df = df_eng.iloc[train_size:]
+    if perform_full_analysis and split_method == 'chronological':
+        train_df = df_eng.iloc[:len(y_train)]
+        test_df = df_eng.iloc[len(y_train):]
         generate_split_report(train_df, test_df, pipe_config)
         generate_leakage_report(df_eng, pipe_config)
 
@@ -535,21 +591,46 @@ def run_experiment(config, pipe_config, include_lights=True, perform_full_analys
     
     logger.info("Computing baseline predictions...")
     
-    y_pred_persistence = compute_persistence_baseline(
-        y_train, y_test, h=pipe_config.forecast_horizon_h,
-        current_load_available=pipe_config.current_load_available
-    )
+    # Baselines are only meaningful/easy for Chronological split
+    # For Random split, persistence/seasonal naive are hard to define on shuffled data without original index
     
-    y_pred_seasonal_daily = compute_seasonal_naive_baseline(
-        y_train, y_test, seasonal_period=144
-    )
-    
-    if len(y_train) >= 1008:
-        y_pred_seasonal_weekly = compute_seasonal_naive_baseline(
-            y_train, y_test, seasonal_period=1008
+    baseline_metrics = {}
+
+    if split_method == 'chronological':
+        y_pred_persistence = compute_persistence_baseline(
+            y_train, y_test, h=pipe_config.forecast_horizon_h,
+            current_load_available=pipe_config.current_load_available
         )
-    else:
-        y_pred_seasonal_weekly = None
+
+        y_pred_seasonal_daily = compute_seasonal_naive_baseline(
+            y_train, y_test, seasonal_period=144
+        )
+
+        if len(y_train) >= 1008:
+            y_pred_seasonal_weekly = compute_seasonal_naive_baseline(
+                y_train, y_test, seasonal_period=1008
+            )
+        else:
+            y_pred_seasonal_weekly = None
+
+        pers_metrics = calculate_metrics(y_test, y_pred_persistence)
+        pers_metrics['Model'] = 'Persistence'
+        pers_metrics['Scenario'] = scenario
+        pers_metrics['Forecast_Horizon'] = pipe_config.forecast_horizon_h
+        baseline_metrics['Persistence'] = pers_metrics
+
+        seas_daily_metrics = calculate_metrics(y_test, y_pred_seasonal_daily)
+        seas_daily_metrics['Model'] = 'Seasonal_Daily'
+        seas_daily_metrics['Scenario'] = scenario
+        seas_daily_metrics['Forecast_Horizon'] = pipe_config.forecast_horizon_h
+        baseline_metrics['Seasonal_Daily'] = seas_daily_metrics
+
+        if y_pred_seasonal_weekly is not None:
+            seas_weekly_metrics = calculate_metrics(y_test, y_pred_seasonal_weekly)
+            seas_weekly_metrics['Model'] = 'Seasonal_Weekly'
+            seas_weekly_metrics['Scenario'] = scenario
+            seas_weekly_metrics['Forecast_Horizon'] = pipe_config.forecast_horizon_h
+            baseline_metrics['Seasonal_Weekly'] = seas_weekly_metrics
     
     logger.info("Training main model (LightGBM)...")
     # Train on ORIGINAL scale - no scaling for tree models
@@ -567,38 +648,18 @@ def run_experiment(config, pipe_config, include_lights=True, perform_full_analys
     metrics['Scenario'] = scenario
     metrics['Forecast_Horizon'] = pipe_config.forecast_horizon_h
     
-    # FIX: Add consistent metadata to ALL baseline rows
-    baseline_metrics = {}
     baseline_metrics['LightGBM'] = metrics.copy()
     
-    pers_metrics = calculate_metrics(y_test, y_pred_persistence)
-    pers_metrics['Model'] = 'Persistence'
-    pers_metrics['Scenario'] = scenario
-    pers_metrics['Forecast_Horizon'] = pipe_config.forecast_horizon_h
-    baseline_metrics['Persistence'] = pers_metrics
+    if split_method == 'chronological':
+        dm_stat, dm_pval = diebold_mariano_test(y_test, y_pred, y_pred_persistence,
+                                                 h=pipe_config.forecast_horizon_h)
+        metrics['DM_vs_Persistence_pval'] = dm_pval
+
+        dm_stat, dm_pval = diebold_mariano_test(y_test, y_pred, y_pred_seasonal_daily,
+                                                 h=pipe_config.forecast_horizon_h)
+        metrics['DM_vs_Seasonal_pval'] = dm_pval
     
-    seas_daily_metrics = calculate_metrics(y_test, y_pred_seasonal_daily)
-    seas_daily_metrics['Model'] = 'Seasonal_Daily'
-    seas_daily_metrics['Scenario'] = scenario
-    seas_daily_metrics['Forecast_Horizon'] = pipe_config.forecast_horizon_h
-    baseline_metrics['Seasonal_Daily'] = seas_daily_metrics
-    
-    if y_pred_seasonal_weekly is not None:
-        seas_weekly_metrics = calculate_metrics(y_test, y_pred_seasonal_weekly)
-        seas_weekly_metrics['Model'] = 'Seasonal_Weekly'
-        seas_weekly_metrics['Scenario'] = scenario
-        seas_weekly_metrics['Forecast_Horizon'] = pipe_config.forecast_horizon_h
-        baseline_metrics['Seasonal_Weekly'] = seas_weekly_metrics
-    
-    dm_stat, dm_pval = diebold_mariano_test(y_test, y_pred, y_pred_persistence, 
-                                             h=pipe_config.forecast_horizon_h)
-    metrics['DM_vs_Persistence_pval'] = dm_pval
-    
-    dm_stat, dm_pval = diebold_mariano_test(y_test, y_pred, y_pred_seasonal_daily,
-                                             h=pipe_config.forecast_horizon_h)
-    metrics['DM_vs_Seasonal_pval'] = dm_pval
-    
-    if perform_full_analysis:
+    if perform_full_analysis and split_method == 'chronological':
         logger.info("Performing full analysis...")
         
         logger.info("Computing prediction intervals (Split Conformal)...")
@@ -789,29 +850,20 @@ def run_toy_optimization_demonstration(baseline_daily_energy_kwh):
     logger.info(f"Toy optimization saved to {outpath('appendix')}/")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Energy Forecasting Pipeline")
-    parser.add_argument('--config', type=str, default='config.yaml')
-    parser.add_argument('--forecast-horizon', type=int, default=6)
-    parser.add_argument('--skip-nested-cv', action='store_true')
-    parser.add_argument('--skip-optimization', action='store_true')
-    parser.add_argument('--no-current-load', action='store_true', help='Assume current load y_t is NOT available at issuance time')
-    parser.add_argument('--quick', action='store_true', help='Smoke test: skip full analysis (conformal/importance/plots) in Phase 1')
-    args = parser.parse_args()
+def run_pipeline_for_horizon(h, args, config):
+    """Executes the full pipeline for a specific horizon h."""
     
-    config = load_config(args.config)
-
     # Run-scoped output directory to avoid stale/mixed artifacts
     base_outputs = config.get('paths', {}).get('outputs', 'outputs')
     run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_dir = Path(base_outputs) / f"run_{run_id}_h{args.forecast_horizon}"
+    run_dir = Path(base_outputs) / f"run_{run_id}_h{h}"
     set_output_dir(str(run_dir))
     ensure_dirs(run_dir)
 
     # Persist run metadata for traceability
     run_meta = {
         'run_id': run_id,
-        'forecast_horizon_h': int(args.forecast_horizon),
+        'forecast_horizon_h': int(h),
         'skip_nested_cv': bool(args.skip_nested_cv),
         'skip_optimization': bool(args.skip_optimization),
         'quick': bool(args.quick),
@@ -828,7 +880,7 @@ if __name__ == "__main__":
         time_col=settings.get('time_col', 'date'),
         test_size_percent=float(settings.get('test_size_percent', 0.25)),
         random_seed=int(settings.get('random_seed', 42)),
-        forecast_horizon_h=int(args.forecast_horizon),
+        forecast_horizon_h=int(h),
         include_lights=bool(settings.get('include_lights', True)),
         lags=[int(x) for x in fe.get('lags', [1, 2, 3, 6, 12, 24, 36])],
         rolling_windows=[int(x) for x in fe.get('rolling_windows', [6, 12, 24])],
@@ -840,39 +892,53 @@ if __name__ == "__main__":
             config.get('assumptions', {}).get('current_load_available', True)
         )
     )
-
-    # Extend run metadata with the *effective* configuration (single source of truth).
-    try:
-        run_meta.update({
-            'time_col': pipe_config.time_col,
-            'random_seed': pipe_config.random_seed,
-            'lags': pipe_config.lags,
-            'rolling_windows': pipe_config.rolling_windows,
-            'current_load_available': pipe_config.current_load_available,
-            'uncertainty': config.get('uncertainty', {}),
-            'config_path': os.path.abspath(args.config)
-        })
-        with open(outpath('run_metadata.json'), 'w') as f:
-            json.dump(run_meta, f, indent=4)
-    except Exception as e:
-        logger.warning(f"Could not update run_metadata.json with effective config: {e}")
-
     
     logger.info("=" * 60)
     logger.info("ENERGY FORECASTING PIPELINE")
     logger.info(f"Forecast Horizon: h={pipe_config.forecast_horizon_h} steps")
     logger.info("=" * 60)
     
+    # --- PHASE 1: Main Experiment (With Lights) ---
     logger.info("\nPHASE 1: Main Experiment (With Lights)")
     metrics_main, baseline_metrics = run_experiment(
         config, pipe_config, include_lights=True, perform_full_analysis=(not args.quick)
     )
     
+    # --- PHASE 2: Comparison Experiment (Without Lights) ---
     logger.info("\nPHASE 2: Comparison Experiment (Without Lights)")
     metrics_no_lights, _ = run_experiment(
         config, pipe_config, include_lights=False, perform_full_analysis=False
     )
     
+    # --- PHASE 3a: Paper Mode (Chronological) ---
+    logger.info("\nPHASE 3a: Paper Mode (Chronological)")
+    # Must adjust config: no lags, no rolling, no current load
+    paper_config = PipelineConfig(
+        target_col=settings['target_col'],
+        time_col=settings.get('time_col', 'date'),
+        test_size_percent=float(settings.get('test_size_percent', 0.25)),
+        random_seed=int(settings.get('random_seed', 42)),
+        forecast_horizon_h=int(h),
+        include_lights=bool(settings.get('include_lights', True)),
+        lags=[], # Strict Paper Mode
+        rolling_windows=[], # Strict Paper Mode
+        n_outer_folds=5, n_inner_folds=3,
+        current_load_available=False # Strict Paper Mode
+    )
+    metrics_paper_chrono, _ = run_experiment(
+        config, paper_config, include_lights=True, perform_full_analysis=False,
+        split_method='chronological', paper_mode=True
+    )
+
+    # --- PHASE 3b: Paper Mode (Random Split) ---
+    logger.info("\nPHASE 3b: Paper Mode (Random Split)")
+    # Same config as paper mode
+    metrics_paper_random, _ = run_experiment(
+        config, paper_config, include_lights=True, perform_full_analysis=False,
+        split_method='random', paper_mode=True
+    )
+
+
     if not args.skip_nested_cv:
         logger.info("\nPHASE 3: Nested Cross-Validation")
         pipe_config.include_lights = True
@@ -892,20 +958,29 @@ if __name__ == "__main__":
 
     # Deliverable C: Scenario Table
     # Need the full DF again for scenario analysis
+    # We use pipeline_core explicitly to load data, ensuring variable is in scope
     df_raw = pipeline_core.load_data(config['paths']['data'])
+
     # Ensure pipe_config.include_lights is True for the "All Features" base
     pipe_config.include_lights = True
     df_eng = pipeline_core.create_physics_features(df_raw, pipe_config)
 
     # Run Scenario Analysis
     # We pass metrics_main (All features) to avoid re-running it.
-    # For "No Lights", we have metrics_no_lights, but run_scenario_analysis expects to run logic.
-    # Let's just update the list in run_scenario_analysis to accept pre-computed.
-
     df_scenarios = run_scenario_analysis(config, pipe_config, df_eng, metrics_main)
 
+    # Add Paper Mode rows manually to the scenarios table
+    df_scenarios = pd.concat([df_scenarios, pd.DataFrame([
+        {'Scenario': 'Paper Mode (Chronological)', 'RMSE': metrics_paper_chrono['RMSE'],
+         'MAE': metrics_paper_chrono['MAE'], 'R2': metrics_paper_chrono['R2']},
+        {'Scenario': 'Paper Mode (Random)', 'RMSE': metrics_paper_random['RMSE'],
+         'MAE': metrics_paper_random['MAE'], 'R2': metrics_paper_random['R2']}
+    ])], ignore_index=True)
+
     # Sort or reorder
-    order = ['All Features', 'No Lights', 'No Weather', 'Only Weather + Time']
+    order = ['All Features', 'No Lights', 'No Weather', 'Only Weather + Time',
+             'Paper Mode (Chronological)', 'Paper Mode (Random)']
+    # Ensure categorical respects the new items
     df_scenarios['Scenario'] = pd.Categorical(df_scenarios['Scenario'], categories=order, ordered=True)
     df_scenarios = df_scenarios.sort_values('Scenario')
 
@@ -936,9 +1011,21 @@ if __name__ == "__main__":
          'MAE': metrics_no_lights['MAE'], 
          'R2': metrics_no_lights['R2'],
          'NRMSE': metrics_no_lights['NRMSE'],
-         'SMAPE': metrics_no_lights['SMAPE']}
+         'SMAPE': metrics_no_lights['SMAPE']},
+        {'Scenario': 'Paper Mode (Chronological)',
+         'RMSE': metrics_paper_chrono['RMSE'],
+         'MAE': metrics_paper_chrono['MAE'],
+         'R2': metrics_paper_chrono['R2'],
+         'NRMSE': metrics_paper_chrono['NRMSE'],
+         'SMAPE': metrics_paper_chrono['SMAPE']},
+        {'Scenario': 'Paper Mode (Random)',
+         'RMSE': metrics_paper_random['RMSE'],
+         'MAE': metrics_paper_random['MAE'],
+         'R2': metrics_paper_random['R2'],
+         'NRMSE': metrics_paper_random['NRMSE'],
+         'SMAPE': metrics_paper_random['SMAPE']}
     ])
-    save_table(df_comp, 'results_with_vs_without_lights')
+    save_table(df_comp, 'results_all_experiments')
     
     if not args.skip_optimization:
         logger.info("\nPHASE 5: Toy Optimization (DEMONSTRATION)")
@@ -947,10 +1034,43 @@ if __name__ == "__main__":
         run_toy_optimization_demonstration(baseline_est)
     
     logger.info("\n" + "=" * 60)
-    logger.info("PIPELINE COMPLETE")
+    logger.info("PIPELINE COMPLETE for horizon h=" + str(h))
     logger.info("=" * 60)
     logger.info(f"\nBest Model RMSE: {metrics_main['RMSE']:.2f} Wh")
     logger.info(f"Best Model R2: {metrics_main['R2']:.4f}")
     if 'PICP' in metrics_main:
         logger.info(f"90% PI Coverage: {metrics_main['PICP']:.1f}%")
     logger.info(f"\nAll artifacts saved to {OUTPUT_DIR}/")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Energy Forecasting Pipeline")
+    parser.add_argument('--config', type=str, default='config.yaml')
+    # Removed --forecast-horizon default since we loop, but kept for compatibility/override if needed?
+    # Actually, we should probably ignore it or use it if user specifically wants one horizon.
+    # But instruction said "Loop over [1, 6]".
+    # Let's keep the argument but if it's default (6) we might loop.
+    # To be cleaner, I will loop [1, 6] by default.
+    # If user provides --forecast-horizon, I'll respect it?
+    # User said: "Cleaner UX: add forecast_horizons: [1, 6] and loop inside main_pipeline.py"
+    # I'll default to [1, 6].
+
+    parser.add_argument('--forecast-horizon', type=int, default=None, help='Specific horizon to run. If not set, runs horizons from config.')
+
+    parser.add_argument('--skip-nested-cv', action='store_true')
+    parser.add_argument('--skip-optimization', action='store_true')
+    parser.add_argument('--no-current-load', action='store_true', help='Assume current load y_t is NOT available at issuance time')
+    parser.add_argument('--quick', action='store_true', help='Smoke test: skip full analysis (conformal/importance/plots) in Phase 1')
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+
+    # Determine horizons to run
+    # Priority: 1. CLI arg, 2. Config file, 3. Default [1, 6]
+    horizons = config.get('settings', {}).get('forecast_horizons', [1, 6])
+    if args.forecast_horizon is not None:
+        horizons = [args.forecast_horizon]
+
+    for h in horizons:
+        logger.info(f"\n\n>>> STARTING RUN FOR HORIZON h={h} <<<")
+        run_pipeline_for_horizon(h, args, config)

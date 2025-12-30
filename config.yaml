@@ -6,6 +6,7 @@ paths:
   data: energydata_complete.csv
   outputs: outputs/
 settings:
+  forecast_horizons: [1, 6]
   time_features: [tod_sin, tod_cos]  # NSM-based time-of-day encoding
   random_seed: 42
   target_col: Appliances
